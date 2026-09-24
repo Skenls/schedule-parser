@@ -1,0 +1,10 @@
+services:
+  schedule_bot:
+    build: .
+    container_name: schedule_bot
+    restart: unless-stopped
+    volumes:
+      # Пробрасываем сессию и БД, чтобы данные сохранялись на хосте:
+      - ./schedule.db:/app/schedule.db
+      - ./channel_listener.session:/app/channel_listener.session
+      - ./config.py:/app/config.py

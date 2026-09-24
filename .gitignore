@@ -1,0 +1,31 @@
+# Secrets & Configs
+config.py
+.env
+*.env
+
+# Telegram / Telethon sessions
+*.session
+*.session-journal
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+schedule.db
+
+# Logs
+log.txt
+*.log
+
+# Python cache & virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.env/
+
+# OS files
+.DS_Store
+Thumbs.db

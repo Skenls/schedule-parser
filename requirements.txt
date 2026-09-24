@@ -1,0 +1,4 @@
+aiogram>=3.13.0
+aiosqlite>=0.20.0
+telethon>=1.36.0
+google-genai>=0.1.1
