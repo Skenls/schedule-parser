@@ -212,18 +212,25 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     Проанализируй фото расписания колледжа.
     1. Найди дату в заголовке листа (например: '07.09.26г.'). 
        Преобразуй её в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
-    2. Проверь наличие группы '{target_group}'. Если группы нет, верни group_found: false.
-    3. Если группа найдена, собери уроки:
-       - lesson_num: номер пары (1-8).
-       - subgroup: 0 (вся группа), 1 (подгруппа 1), 2 (подгруппа 2).
-       - subject: предмет.
-       - auditorium: номер кабинета (строка).
-       - teacher: преподаватель.
+    2. Найди в таблице целевую группу '{target_group}'. Если группы нет, верни group_found: false.
+    3. ВНИМАТЕЛЬНО изучи каждую строку/пару для группы '{target_group}'.
+       В таблице колледжа ячейка одной пары (No ур.) очень часто разделена на ДВЕ СТРОКИ текста:
+       - ВЕРХНЯЯ СТРОКА текста = 1-я подгруппа (subgroup: 1).
+       - НИЖНЯЯ СТРОКА текста = 2-я подгруппа (subgroup: 2).
+       - Колонки 'Ауд' и 'Преподаватель' точно так же содержат верхнюю строку (для 1-й подгруппы) и нижнюю строку (для 2-й подгруппы).
 
-    ВАЖНО:
-    - Пара (lesson_num, subgroup) должна быть УНИКАЛЬНОЙ.
-    - Если на одну пару приходится 2 записи (разные дисциплины или подгруппы), ОБЯЗАТЕЛЬНО укажи для одной subgroup: 1, а для другой subgroup: 2.
-    - Не дублируй номер пары с одной и той же подгруппой.
+       Важные правила подгрупп:
+       - Если в ячейке пары две разные строки (например, сверху 'ИнженерГрафика', ауд 306, а снизу 'ИнЯзык', ауд 308) — это ОБЯЗАТЕЛЬНО две разные записи: первая с subgroup: 1, вторая с subgroup: 2!
+       - Если в ячейке пары один и тот же предмет написан в две строки (например, 'ТехнологияПО' сверху и 'ТехнологияПО' снизу) — это тоже деление на подгруппы: сделай две записи с subgroup: 1 и subgroup: 2.
+       - Если по физкультуре указана 'ФизичКультура' и 'СМГ' (или два преподавателя) — раздели на subgroup: 1 ('ФизичКультура') и subgroup: 2 ('СМГ').
+       - Только если предмет и кабинет строго в одну строку на всю ширину и высоту ячейки (например, 'ЗащитаНаселен') — ставь subgroup: 0 (вся группа).
+
+       Собери уроки:
+       - lesson_num: номер пары (1-8).
+       - subgroup: 0 (вся группа), 1 (1 подгруппа / верхняя строка), 2 (2 подгруппа / нижняя строка).
+       - subject: название предмета.
+       - auditorium: номер кабинета (строка, или пустая строка если нет).
+       - teacher: преподаватель (строка, или пустая строка если нет).
 
     Ответ СТРОГО валидным JSON:
     {{
@@ -232,7 +239,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         "lessons": [
             {{
                 "lesson_num": 1,
-                "subgroup": 0,
+                "subgroup": 1,
                 "subject": "Название",
                 "auditorium": "304",
                 "teacher": "Иванов"
@@ -240,7 +247,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         ]
     }}
     """
-    models_to_try = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite']
+    models_to_try = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']
 
     for model_name in models_to_try:
         for attempt in range(2):  # Делаем 2 попытки на модель при сетевых сбоях
@@ -354,6 +361,47 @@ async def sync_schedule_if_needed(force: bool = False) -> list[str]:
                     logger.info(f"Сохранен лист на будущее ({parsed_date}). Продолжаем поиск сегодняшнего...")
 
         return updated_dates
+
+
+async def sync_nextday_schedule() -> tuple[bool, str, str]:
+    """
+    Ищет в канале расписание на следующий учебный день.
+    Возвращает (success: bool, target_next_date: str, found_date: str):
+    - success=True: найдено и сохранено расписание на target_next_date.
+    - success=False, found_date=today_str: встречен сегодняшний лист, значит следующий день еще не опубликован.
+    - success=False, found_date="": ничего подходящего не найдено в пределах лимита.
+    """
+    async with parse_lock:
+        now = datetime.now(TZ)
+        today_str = now.strftime("%Y-%m-%d")
+        if now.weekday() == 5:
+            next_date_str = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+        else:
+            next_date_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        target_chat = getattr(config, 'CHANNEL_TARGET', None) or getattr(config, 'CHANNEL_USERNAME', None)
+        max_history = 15
+
+        logger.info(f"Запуск ручного поиска расписания на следующий день ({next_date_str})...")
+
+        async for msg in telethon_client.iter_messages(target_chat, limit=max_history):
+            if not msg.photo:
+                continue
+
+            logger.info(f"Скачиваем фото из поста ID: {msg.id} для проверки следующего дня...")
+            parsed_date = await process_photo_message(msg, next_date_str)
+            await asyncio.sleep(2)
+
+            if parsed_date:
+                if parsed_date == next_date_str:
+                    logger.info(f"🎉 Расписание на следующий день ({next_date_str}) успешно найдено и сохранено!")
+                    return True, next_date_str, parsed_date
+
+                if parsed_date == today_str:
+                    logger.info(f"Встречен лист на сегодня ({today_str}). Листа на следующий день ({next_date_str}) ещё нет.")
+                    return False, next_date_str, today_str
+
+        return False, next_date_str, ""
 
 
 # --- СЛУШАТЕЛЬ КАНАЛА TELEGRAM ---
@@ -678,6 +726,47 @@ async def cmd_parse(message: types.Message):
             )
     except Exception as e:
         logger.error(f"Ошибка при ручном парсинге (/parse): {e}")
+        await status_msg.edit_text(f"❌ Произошла ошибка при парсинге: {e}")
+
+
+@dp.message(Command("parsenext"))
+async def cmd_parsenext(message: types.Message):
+    """Ручной поиск и парсинг расписания на следующий учебный день (только админ)."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+
+    if parse_lock.locked():
+        await message.answer("⚠️ Парсинг уже выполняется. Пожалуйста, подождите...")
+        return
+
+    now = datetime.now(TZ)
+    if now.weekday() == 5:
+        next_date_str = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+    else:
+        next_date_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    status_msg = await message.answer(f"⏳ Ищу в канале расписание на следующий день ({next_date_str})...")
+    try:
+        success, target_next_date, found_date = await sync_nextday_schedule()
+        if success:
+            await status_msg.edit_text(
+                f"✅ Расписание на следующий день (**{target_next_date}**) успешно найдено и сохранено в базе!",
+                parse_mode="Markdown"
+            )
+        elif found_date == datetime.now(TZ).strftime("%Y-%m-%d"):
+            await status_msg.edit_text(
+                f"ℹ️ Расписания на следующий день (**{target_next_date}**) в канале ещё нет.\n"
+                f"Последний опубликованный лист в канале — на сегодня (**{found_date}**).",
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text(
+                f"ℹ️ Расписание на следующий день (**{target_next_date}**) в последних постах канала не найдено.",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при ручном парсинге следующего дня (/parsenext): {e}")
         await status_msg.edit_text(f"❌ Произошла ошибка при парсинге: {e}")
 
 
