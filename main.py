@@ -18,6 +18,10 @@ import config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Подавляем избыточные логи сторонних библиотек
+logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Инициализация клиентов
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
@@ -25,6 +29,22 @@ ai_client = genai.Client(api_key=config.GEMINI_API_KEY)
 telethon_client = TelegramClient('channel_listener', config.TELEGRAM_API_ID, config.TELEGRAM_API_HASH)
 
 TZ = ZoneInfo(config.TIMEZONE)
+parse_lock = asyncio.Lock()
+
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором."""
+    admin_ids = getattr(config, 'ADMIN_IDS', [])
+    if isinstance(admin_ids, int):
+        return user_id == admin_ids
+    if isinstance(admin_ids, (list, tuple, set)):
+        return user_id in admin_ids
+    if isinstance(admin_ids, str):
+        try:
+            return user_id in [int(x.strip()) for x in admin_ids.split(",") if x.strip()]
+        except ValueError:
+            return False
+    return False
 
 # Сетка звонков: (конец_урока_ч, конец_урока_м, время_уведомления_ч, время_уведомления_м)
 BELL_SCHEDULE = {
@@ -90,24 +110,97 @@ async def cleanup_past_schedule(today_str: str):
     logger.info(f"Очистка БД: удалены прошедшие дни до {today_str}.")
 
 
+def normalize_lessons(lessons: list[dict]) -> list[dict]:
+    """
+    Нормализует список уроков от Gemini:
+    - Проверяет корректность lesson_num и subgroup.
+    - Если для одного lesson_num две записи с subgroup=0, переводит их в subgroup 1 и 2.
+    - Объединяет дублирующиеся записи с одинаковыми (lesson_num, subgroup).
+    """
+    if not lessons:
+        return []
+
+    by_lesson: dict[int, list[dict]] = {}
+    for item in lessons:
+        if not isinstance(item, dict):
+            continue
+        try:
+            l_num = int(item.get("lesson_num", 0))
+        except (ValueError, TypeError):
+            continue
+        if l_num < 1 or l_num > 10:
+            continue
+        try:
+            sub = int(item.get("subgroup", 0))
+        except (ValueError, TypeError):
+            sub = 0
+
+        subject = str(item.get("subject", "")).strip()
+        if not subject:
+            continue
+        auditorium = str(item.get("auditorium", "")).strip()
+        teacher = str(item.get("teacher", "")).strip()
+
+        cleaned_item = {
+            "lesson_num": l_num,
+            "subgroup": sub,
+            "subject": subject,
+            "auditorium": auditorium,
+            "teacher": teacher
+        }
+        by_lesson.setdefault(l_num, []).append(cleaned_item)
+
+    normalized: list[dict] = []
+    for l_num, items in sorted(by_lesson.items()):
+        zeros = [it for it in items if it["subgroup"] == 0]
+        non_zeros = [it for it in items if it["subgroup"] != 0]
+
+        if len(zeros) == 2 and not non_zeros:
+            zeros[0]["subgroup"] = 1
+            zeros[1]["subgroup"] = 2
+
+        merged_by_sub: dict[int, dict] = {}
+        for it in items:
+            sub = it["subgroup"]
+            if sub not in merged_by_sub:
+                merged_by_sub[sub] = dict(it)
+            else:
+                existing = merged_by_sub[sub]
+                if it["subject"] and it["subject"] not in existing["subject"]:
+                    existing["subject"] = f"{existing['subject']} / {it['subject']}"
+                if it["auditorium"] and it["auditorium"] not in existing["auditorium"]:
+                    existing["auditorium"] = f"{existing['auditorium']} / {it['auditorium']}" if existing["auditorium"] else it["auditorium"]
+                if it["teacher"] and it["teacher"] not in existing["teacher"]:
+                    existing["teacher"] = f"{existing['teacher']}, {it['teacher']}" if existing["teacher"] else it["teacher"]
+
+        normalized.extend(merged_by_sub.values())
+
+    return normalized
+
+
 async def save_schedule_for_date(target_date: str, lessons: list[dict]):
-    """Перезаписывает расписание на конкретную дату."""
+    """Перезаписывает расписание на конкретную дату с защитой от дубликатов."""
+    clean_lessons = normalize_lessons(lessons)
+    if not clean_lessons:
+        logger.warning(f"Нет валидных уроков для сохранения на {target_date}.")
+        return
+
     async with aiosqlite.connect("schedule.db") as db:
         await db.execute("DELETE FROM schedule WHERE date = ?", (target_date,))
-        for item in lessons:
+        for item in clean_lessons:
             await db.execute("""
-                INSERT INTO schedule (date, lesson_num, subgroup, subject, auditorium, teacher)
+                INSERT OR REPLACE INTO schedule (date, lesson_num, subgroup, subject, auditorium, teacher)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 target_date,
                 item["lesson_num"],
                 item["subgroup"],
                 item["subject"],
-                str(item.get("auditorium", "")),
-                str(item.get("teacher", ""))
+                item["auditorium"],
+                item["teacher"]
             ))
         await db.commit()
-    logger.info(f"✅ Расписание на {target_date} успешно сохранено/перезаписано в БД.")
+    logger.info(f"✅ Расписание на {target_date} успешно сохранено/перезаписано в БД ({len(clean_lessons)} уроков).")
 
 
 # --- РАСПОЗНАВАНИЕ ЧЕРЕЗ GEMINI (С RETRY И FALLBACK) ---
@@ -120,10 +213,15 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     2. Проверь наличие группы '{target_group}'. Если группы нет, верни group_found: false.
     3. Если группа найдена, собери уроки:
        - lesson_num: номер пары (1-8).
-       - subgroup: 0 (вся группа), 1 (подгруппа 1), 2 (подгруппа 2). Если на один урок 2 записи — делай 1 и 2.
+       - subgroup: 0 (вся группа), 1 (подгруппа 1), 2 (подгруппа 2).
        - subject: предмет.
        - auditorium: номер кабинета (строка).
        - teacher: преподаватель.
+
+    ВАЖНО:
+    - Пара (lesson_num, subgroup) должна быть УНИКАЛЬНОЙ.
+    - Если на одну пару приходится 2 записи (разные дисциплины или подгруппы), ОБЯЗАТЕЛЬНО укажи для одной subgroup: 1, а для другой subgroup: 2.
+    - Не дублируй номер пары с одной и той же подгруппой.
 
     Ответ СТРОГО валидным JSON:
     {{
@@ -156,7 +254,19 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                         temperature=0.1
                     )
                 )
-                return json.loads(response.text)
+                text = response.text
+                if not text:
+                    logger.warning(f"Пустой ответ от {model_name}.")
+                    continue
+                text = text.strip()
+                if text.startswith("```"):
+                    lines = text.splitlines()
+                    if lines and lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    text = "\n".join(lines).strip()
+                return json.loads(text)
             except Exception as e:
                 err_str = str(e)
                 if "503" in err_str or "UNAVAILABLE" in err_str:
@@ -174,17 +284,19 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     return {}
 
 
-async def process_photo_message(msg, today_str: str) -> str | None:
+async def process_photo_message(msg, fallback_date: str | None = None) -> str | None:
     """Скачивает фото и сохраняет расписание при обнаружении группы."""
     if not msg.photo:
         return None
 
     img_data = await msg.download_media(file=bytes)
-    result = await asyncio.to_thread(parse_image_with_gemini, img_data, config.TARGET_GROUP)
+    result = await asyncio.to_thread(parse_image_with_gemini, img_data, config.TARGET_GROUP, fallback_date)
 
     doc_date = result.get("date")
-    if not doc_date:
+    if not doc_date or not isinstance(doc_date, str):
         return None
+
+    doc_date = doc_date.strip()
 
     if result.get("group_found") and result.get("lessons"):
         await save_schedule_for_date(doc_date, result["lessons"])
@@ -195,66 +307,85 @@ async def process_photo_message(msg, today_str: str) -> str | None:
 
 # --- СИНХРОНИЗАЦИЯ РАСПИСАНИЯ ---
 
-async def sync_schedule_if_needed():
-    """Синхронизирует расписание при старте и в 06:00."""
-    now = datetime.now(TZ)
-    if now.weekday() == 6:
-        return
+async def sync_schedule_if_needed(force: bool = False) -> list[str]:
+    """
+    Синхронизирует расписание при старте, в 06:00 или по вызову /parse.
+    Возвращает список сохраненных/обновленных дат.
+    """
+    async with parse_lock:
+        now = datetime.now(TZ)
+        if not force and now.weekday() == 6:
+            return []
 
-    today_str = now.strftime("%Y-%m-%d")
+        today_str = now.strftime("%Y-%m-%d")
 
-    # 1. Очищаем старые дни
-    await cleanup_past_schedule(today_str)
+        # 1. Очищаем старые дни
+        await cleanup_past_schedule(today_str)
 
-    # 2. Проверяем наличие расписания на сегодня
-    if await has_schedule_for_date(today_str):
-        logger.info(f"Расписание на сегодня ({today_str}) уже есть в базе. Пропуск поиска.")
-        return
+        # 2. Проверяем наличие расписания на сегодня (если не force)
+        if not force and await has_schedule_for_date(today_str):
+            logger.info(f"Расписание на сегодня ({today_str}) уже есть в базе. Пропуск поиска.")
+            return []
 
-    logger.info(f"Расписания на сегодня ({today_str}) нет в базе. Ищем в канале...")
-    target_chat = getattr(config, 'CHANNEL_TARGET', getattr(config, 'CHANNEL_USERNAME', None))
-    max_history = 15
+        logger.info(f"Ищем расписание в канале (force={force})...")
+        target_chat = getattr(config, 'CHANNEL_TARGET', None) or getattr(config, 'CHANNEL_USERNAME', None)
+        max_history = 15
+        updated_dates: list[str] = []
 
-    async for msg in telethon_client.iter_messages(target_chat, limit=max_history):
-        if not msg.photo:
-            continue
+        async for msg in telethon_client.iter_messages(target_chat, limit=max_history):
+            if not msg.photo:
+                continue
 
-        logger.info(f"Скачиваем фото из поста ID: {msg.id}...")
-        parsed_date = await process_photo_message(msg, today_str)
-        await asyncio.sleep(3)
+            logger.info(f"Скачиваем фото из поста ID: {msg.id}...")
+            parsed_date = await process_photo_message(msg, today_str)
+            await asyncio.sleep(2)
 
-        if await has_schedule_for_date(today_str):
-            logger.info(f"🎉 Расписание на сегодня ({today_str}) успешно найдено и загружено!")
-            break
+            if parsed_date:
+                if parsed_date not in updated_dates:
+                    updated_dates.append(parsed_date)
 
-        if parsed_date and parsed_date > today_str:
-            logger.info(f"Сохранен лист на будущее ({parsed_date}). Продолжаем поиск сегодняшнего...")
+                if parsed_date == today_str and not force:
+                    logger.info(f"🎉 Расписание на сегодня ({today_str}) успешно найдено и загружено!")
+                    break
+
+                if parsed_date > today_str and not force:
+                    logger.info(f"Сохранен лист на будущее ({parsed_date}). Продолжаем поиск сегодняшнего...")
+
+        return updated_dates
 
 
 # --- СЛУШАТЕЛЬ КАНАЛА TELEGRAM ---
 
 @telethon_client.on(events.NewMessage())
 async def handle_channel_post(event):
-    chat = await event.get_chat()
-    target = getattr(config, 'CHANNEL_TARGET', getattr(config, 'CHANNEL_USERNAME', None))
-
-    is_target_channel = False
-    if isinstance(target, str):
-        if (getattr(chat, 'username', '') or '').lower() == target.lower().lstrip('@'):
-            is_target_channel = True
-    elif isinstance(target, int) and event.chat_id == target:
-        is_target_channel = True
-
-    if not is_target_channel or not event.photo:
+    if not event.photo:
         return
 
-    logger.info("В канале появился новый пост с фото! Запускаем обработку...")
+    target_id = config.CHANNEL_USERNAME if isinstance(getattr(config, 'CHANNEL_USERNAME', None), int) else None
+    target_name = getattr(config, 'CHANNEL_TARGET', None)
+
+    is_target_channel = False
+    if target_id and event.chat_id == target_id:
+        is_target_channel = True
+    elif target_name:
+        try:
+            chat = await event.get_chat()
+            if (getattr(chat, 'username', '') or '').lower() == str(target_name).lower().lstrip('@'):
+                is_target_channel = True
+        except Exception:
+            pass
+
+    if not is_target_channel:
+        return
+
+    logger.info("В целевом канале появился новый пост с фото! Запускаем обработку...")
     now = datetime.now(TZ)
     today_str = now.strftime("%Y-%m-%d")
 
-    parsed_date = await process_photo_message(event.message, today_str)
-    if parsed_date:
-        logger.info(f"Пост успешно обработан. Данные на {parsed_date} обновлены.")
+    async with parse_lock:
+        parsed_date = await process_photo_message(event.message, today_str)
+        if parsed_date:
+            logger.info(f"Пост успешно обработан. Данные на {parsed_date} обновлены.")
 
 
 # --- УВЕДОМЛЕНИЯ И ПЛАНИРОВЩИК ---
@@ -302,6 +433,7 @@ async def send_lesson_alert(today_str: str, next_lesson_num: int, break_start_st
 
 async def notification_loop():
     last_6am_check_date = None
+    last_notified: set[tuple[str, int]] = set()
 
     while True:
         now = datetime.now(TZ)
@@ -311,6 +443,7 @@ async def notification_loop():
         # Ежедневная проверка в 06:00 утра
         if now.hour == 6 and now.minute == 0 and last_6am_check_date != today_str:
             last_6am_check_date = today_str
+            last_notified.clear()
             logger.info("⏰ 06:00 утра: выполняем плановую проверку расписания на день...")
             try:
                 await sync_schedule_if_needed()
@@ -324,9 +457,12 @@ async def notification_loop():
 
             for lesson_num, (break_start_time, notify_time) in schedule_grid.items():
                 if now.hour == notify_time[0] and now.minute == notify_time[1]:
-                    break_str = f"{break_start_time[0]:02d}:{break_start_time[1]:02d}"
-                    next_lesson_num = lesson_num + 1
-                    await send_lesson_alert(today_str, next_lesson_num, break_str)
+                    alert_key = (today_str, lesson_num)
+                    if alert_key not in last_notified:
+                        last_notified.add(alert_key)
+                        break_str = f"{break_start_time[0]:02d}:{break_start_time[1]:02d}"
+                        next_lesson_num = lesson_num + 1
+                        await send_lesson_alert(today_str, next_lesson_num, break_str)
 
         await asyncio.sleep(60 - datetime.now(TZ).second)
 
@@ -395,9 +531,43 @@ async def cmd_today(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 
+@dp.message(Command("parse"))
+async def cmd_parse(message: types.Message):
+    """Принудительно запускает поиск и парсинг расписания из канала (только админ)."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+
+    if parse_lock.locked():
+        await message.answer("⚠️ Парсинг уже выполняется. Пожалуйста, подождите...")
+        return
+
+    status_msg = await message.answer("⏳ Запускаю ручной парсинг расписания из канала...")
+    try:
+        updated_dates = await sync_schedule_if_needed(force=True)
+        if updated_dates:
+            dates_str = ", ".join(sorted(set(updated_dates)))
+            await status_msg.edit_text(
+                f"✅ Парсинг успешно завершён!\nОбновлены данные на: **{dates_str}**.",
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text(
+                f"ℹ️ Парсинг завершён.\nНовых расписаний для группы **{config.TARGET_GROUP}** в последних постах канала не найдено.",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при ручном парсинге (/parse): {e}")
+        await status_msg.edit_text(f"❌ Произошла ошибка при парсинге: {e}")
+
+
 @dp.message(Command("test"))
 async def cmd_test(message: types.Message):
-    """Отправляет тестовое уведомление ТОЛЬКО вызвавшему команду."""
+    """Отправляет тестовое уведомление ТОЛЬКО вызвавшему админу."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+
     now = datetime.now(TZ)
     today_str = now.strftime("%Y-%m-%d")
     await send_lesson_alert(
@@ -420,7 +590,10 @@ async def main():
     logger.info("Telethon подключен.")
 
     # Проверка базы при запуске бота
-    await sync_schedule_if_needed()
+    try:
+        await sync_schedule_if_needed()
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации расписания при старте: {e}")
 
     await asyncio.gather(
         telethon_client.run_until_disconnected(),
