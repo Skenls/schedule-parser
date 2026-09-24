@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -49,6 +49,7 @@ def is_admin(user_id: int) -> bool:
 # Сетка звонков: (конец_урока_ч, конец_урока_м, время_уведомления_ч, время_уведомления_м)
 BELL_SCHEDULE = {
     "weekday": {
+        0: ((8, 0), (7, 45)),
         1: ((8, 45), (8, 30)),
         2: ((9, 40), (9, 25)),
         3: ((10, 35), (10, 20)),
@@ -59,6 +60,7 @@ BELL_SCHEDULE = {
         8: ((15, 20), (15, 5)),
     },
     "saturday": {
+        0: ((8, 0), (7, 45)),
         1: ((8, 45), (8, 30)),
         2: ((9, 40), (9, 25)),
         3: ((10, 35), (10, 20)),
@@ -390,14 +392,28 @@ async def handle_channel_post(event):
 
 # --- УВЕДОМЛЕНИЯ И ПЛАНИРОВЩИК ---
 
-async def send_lesson_alert(today_str: str, next_lesson_num: int, break_start_str: str, target_user_id: int | None = None):
-    """Отправляет уведомление всем (по расписанию) или конкретному пользователю (/test)."""
+async def send_lesson_alert(
+    today_str: str,
+    lesson_num: int,
+    break_start_str: str,
+    target_user_id: int | None = None,
+    force: bool = False
+):
+    """
+    Отправляет уведомления пользователям с учетом их индивидуального расписания и подгрупп.
+    - lesson_num: текущий номер слота (0 — уведомление за 15 мин до 1-го урока).
+    - break_start_str: время начала перемены или первого урока (HH:MM).
+    - target_user_id: если задан, отправляет только этому пользователю (/test).
+    - force: если True, принудительно отправляет тестовое уведомление.
+    """
+    next_lesson_num = lesson_num + 1
+
     async with aiosqlite.connect("schedule.db") as db:
         async with db.execute(
-            "SELECT subgroup, subject, auditorium FROM schedule WHERE date = ? AND lesson_num = ?",
-            (today_str, next_lesson_num)
+            "SELECT lesson_num, subgroup, subject, auditorium FROM schedule WHERE date = ?",
+            (today_str,)
         ) as cursor:
-            next_lessons = await cursor.fetchall()
+            all_today_lessons = await cursor.fetchall()
 
         if target_user_id:
             async with db.execute("SELECT user_id, subgroup FROM users WHERE user_id = ?", (target_user_id,)) as cursor:
@@ -407,23 +423,78 @@ async def send_lesson_alert(today_str: str, next_lesson_num: int, break_start_st
                 users = await cursor.fetchall()
 
     for user_id, user_sub in users:
-        matched = []
-        if next_lessons:
-            for sub, subj, aud in next_lessons:
-                if user_sub == 0 or sub == 0 or sub == user_sub:
-                    matched.append((sub, subj, aud))
+        user_lessons = [
+            (l_num, sub, subj, aud)
+            for l_num, sub, subj, aud in all_today_lessons
+            if user_sub == 0 or sub == 0 or sub == user_sub
+        ]
 
-        if not next_lessons or not matched:
-            text = (
-                f"🔔 В **{break_start_str}** начинается перемена!\n\n"
-                f"Следующего ({next_lesson_num}) урока у вас нет — можно отдыхать."
-            )
-        else:
-            text = f"⏳ В **{break_start_str}** начинается перемена!\n\n📌 **Следующий урок ({next_lesson_num}):**\n"
+        # Для принудительного теста (/test)
+        if force:
+            matched = [(sub, subj, aud) for l_num, sub, subj, aud in user_lessons if l_num == next_lesson_num]
+            if matched:
+                text = f"⏳ В **{break_start_str}** начинается перемена!\n\n📌 **Следующий урок ({next_lesson_num}):**\n"
+                for sub, subj, aud in matched:
+                    sub_label = f" (Подгруппа {sub})" if sub > 0 else ""
+                    room = f"каб. {aud}" if aud else "кабинет не указан"
+                    text += f"• **{subj}**{sub_label} — 🚪 {room}\n"
+            else:
+                text = (
+                    f"🔔 В **{break_start_str}** начинается перемена!\n\n"
+                    f"Следующего ({next_lesson_num}) урока у вас нет — можно отдыхать."
+                )
+            try:
+                await bot.send_message(user_id, text, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление {user_id}: {e}")
+            continue
+
+        # Если у пользователя сегодня вообще нет уроков — не беспокоим
+        if not user_lessons:
+            continue
+
+        user_lesson_nums = {l_num for l_num, _, _, _ in user_lessons}
+        first_lesson = min(user_lesson_nums)
+        last_lesson = max(user_lesson_nums)
+
+        # 1. До первого урока: уведомляем ТОЛЬКО за 15 минут до первого урока пользователя (lesson_num == first_lesson - 1)
+        if lesson_num < first_lesson - 1:
+            continue
+
+        # 2. После последнего урока дня: больше никаких уведомлений не присылаем
+        if lesson_num > last_lesson:
+            continue
+
+        # 3. Уведомление перед первым уроком (при lesson_num == 0 и первом уроке 1)
+        if lesson_num == 0:
+            matched = [(sub, subj, aud) for l_num, sub, subj, aud in user_lessons if l_num == 1]
+            text = f"⏳ В **{break_start_str}** начинается 1-й урок!\n\n📌 **Следующий урок (1):**\n"
             for sub, subj, aud in matched:
                 sub_label = f" (Подгруппа {sub})" if sub > 0 else ""
                 room = f"каб. {aud}" if aud else "кабинет не указан"
                 text += f"• **{subj}**{sub_label} — 🚪 {room}\n"
+
+        # 4. Уведомление в конце последнего урока дня
+        elif lesson_num == last_lesson:
+            text = (
+                f"🔔 В **{break_start_str}** заканчиваются уроки!\n\n"
+                f"Следующего ({next_lesson_num}) урока у вас нет — можно отдыхать."
+            )
+
+        # 5. Уведомление в течение дня (перед следующим уроком или окном)
+        else:
+            matched = [(sub, subj, aud) for l_num, sub, subj, aud in user_lessons if l_num == next_lesson_num]
+            if matched:
+                text = f"⏳ В **{break_start_str}** начинается перемена!\n\n📌 **Следующий урок ({next_lesson_num}):**\n"
+                for sub, subj, aud in matched:
+                    sub_label = f" (Подгруппа {sub})" if sub > 0 else ""
+                    room = f"каб. {aud}" if aud else "кабинет не указан"
+                    text += f"• **{subj}**{sub_label} — 🚪 {room}\n"
+            else:
+                text = (
+                    f"🔔 В **{break_start_str}** начинается перемена!\n\n"
+                    f"Следующего ({next_lesson_num}) урока у вас нет — можно отдыхать."
+                )
 
         try:
             await bot.send_message(user_id, text, parse_mode="Markdown")
@@ -461,8 +532,7 @@ async def notification_loop():
                     if alert_key not in last_notified:
                         last_notified.add(alert_key)
                         break_str = f"{break_start_time[0]:02d}:{break_start_time[1]:02d}"
-                        next_lesson_num = lesson_num + 1
-                        await send_lesson_alert(today_str, next_lesson_num, break_str)
+                        await send_lesson_alert(today_str, lesson_num, break_str)
 
         await asyncio.sleep(60 - datetime.now(TZ).second)
 
@@ -531,6 +601,56 @@ async def cmd_today(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 
+@dp.message(Command("nextday"))
+async def cmd_nextday(message: types.Message):
+    """Показывает расписание на следующий учебный день."""
+    now = datetime.now(TZ)
+    # Если суббота (5), следующим днем обычно является понедельник (+2 дня)
+    if now.weekday() == 5:
+        sunday_str = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+        monday_str = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+        if await has_schedule_for_date(sunday_str):
+            target_date = sunday_str
+        else:
+            target_date = monday_str
+    else:
+        target_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect("schedule.db") as db:
+        async with db.execute("SELECT subgroup FROM users WHERE user_id = ?", (message.from_user.id,)) as c:
+            row = await c.fetchone()
+            user_sub = row[0] if row else 0
+
+        async with db.execute(
+            "SELECT lesson_num, subgroup, subject, auditorium FROM schedule WHERE date = ? ORDER BY lesson_num, subgroup",
+            (target_date,)
+        ) as c:
+            rows = await c.fetchall()
+
+    if not rows:
+        await message.answer(f"📅 На следующий день ({target_date}) расписание в базе не найдено.")
+        return
+
+    user_rows = [
+        (l_num, sub, subj, aud)
+        for l_num, sub, subj, aud in rows
+        if user_sub == 0 or sub == 0 or sub == user_sub
+    ]
+
+    sub_label = "Вся группа" if user_sub == 0 else f"{user_sub}-я подгруппа"
+    text = f"📅 **Расписание на следующий день ({target_date})**\nПрофиль: **{sub_label}**\n\n"
+
+    if not user_rows:
+        text += "Пар для вашей подгруппы нет — можно отдыхать!"
+    else:
+        for l_num, sub, subj, aud in user_rows:
+            sub_info = f" _(подгр. {sub})_" if sub > 0 else ""
+            room = f"каб. **{aud}**" if aud else "каб. не указан"
+            text += f"• **{l_num} пара:** {subj}{sub_info} — {room}\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
+
 @dp.message(Command("parse"))
 async def cmd_parse(message: types.Message):
     """Принудительно запускает поиск и парсинг расписания из канала (только админ)."""
@@ -572,9 +692,10 @@ async def cmd_test(message: types.Message):
     today_str = now.strftime("%Y-%m-%d")
     await send_lesson_alert(
         today_str=today_str,
-        next_lesson_num=2,
+        lesson_num=1,
         break_start_str="09:40",
-        target_user_id=message.from_user.id
+        target_user_id=message.from_user.id,
+        force=True
     )
     await message.answer("Тестовое уведомление отправлено.")
 
