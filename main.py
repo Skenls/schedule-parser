@@ -116,7 +116,11 @@ def normalize_lessons(lessons: list[dict]) -> list[dict]:
     """
     Нормализует список уроков от Gemini:
     - Проверяет корректность lesson_num и subgroup.
-    - Если для одного lesson_num две записи с subgroup=0, переводит их в subgroup 1 и 2.
+    - Удаляет ошибочно попавшую в кабинет спецмедгруппу (СМГ -> кабинет пустой).
+    - Если для одного lesson_num строки дублируются (одинаковый предмет, ауд и преподаватель) —
+      схлопывает в один урок для всей группы (subgroup: 0).
+    - Если для урока только одна запись — выставляет subgroup: 0 (вся группа).
+    - Если для одного lesson_num две разные записи с subgroup=0, переводит их в subgroup 1 и 2.
     - Объединяет дублирующиеся записи с одинаковыми (lesson_num, subgroup).
     """
     if not lessons:
@@ -143,6 +147,10 @@ def normalize_lessons(lessons: list[dict]) -> list[dict]:
         auditorium = str(item.get("auditorium", "")).strip()
         teacher = str(item.get("teacher", "")).strip()
 
+        # Если в кабинет ошибочно попала спецмедгруппа (СМГ)
+        if auditorium.lower().startswith("смг"):
+            auditorium = ""
+
         cleaned_item = {
             "lesson_num": l_num,
             "subgroup": sub,
@@ -154,13 +162,44 @@ def normalize_lessons(lessons: list[dict]) -> list[dict]:
 
     normalized: list[dict] = []
     for l_num, items in sorted(by_lesson.items()):
+        # Если только один урок в этой паре — это вся группа (subgroup: 0)
+        if len(items) == 1:
+            items[0]["subgroup"] = 0
+            normalized.append(items[0])
+            continue
+
+        # Проверяем, являются ли строки одинаковыми (дубликат строк бланка для всей группы)
+        first = items[0]
+        all_same = True
+        for it in items[1:]:
+            same_subj = first["subject"].lower() == it["subject"].lower()
+            same_aud = first["auditorium"] == it["auditorium"]
+            same_teacher = (
+                not first["teacher"] or not it["teacher"] or
+                first["teacher"].lower() == it["teacher"].lower()
+            )
+            if not (same_subj and same_aud and same_teacher):
+                all_same = False
+                break
+
+        if all_same:
+            teacher = first["teacher"] or items[1]["teacher"]
+            normalized.append({
+                "lesson_num": l_num,
+                "subgroup": 0,
+                "subject": first["subject"],
+                "auditorium": first["auditorium"],
+                "teacher": teacher
+            })
+            continue
+
+        # Если строки разные, но у обеих subgroup == 0 — разносим по подгруппам 1 и 2
         zeros = [it for it in items if it["subgroup"] == 0]
-        non_zeros = [it for it in items if it["subgroup"] != 0]
+        if len(zeros) == 2 and len(items) == 2:
+            items[0]["subgroup"] = 1
+            items[1]["subgroup"] = 2
 
-        if len(zeros) == 2 and not non_zeros:
-            zeros[0]["subgroup"] = 1
-            zeros[1]["subgroup"] = 2
-
+        # Схлопываем дубли с одинаковым subgroup внутри пары
         merged_by_sub: dict[int, dict] = {}
         for it in items:
             sub = it["subgroup"]
@@ -210,27 +249,31 @@ async def save_schedule_for_date(target_date: str, lessons: list[dict]):
 def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date: str | None = None) -> dict:
     prompt = f"""
     Проанализируй фото расписания колледжа.
-    1. Найди дату в заголовке листа (например: '07.09.26г.'). 
+    1. Найди дату в заголовке листа (например: '25.09.26г.'). 
        Преобразуй её в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
     2. Найди в таблице целевую группу '{target_group}'. Если группы нет, верни group_found: false.
-    3. ВНИМАТЕЛЬНО изучи каждую строку/пару для группы '{target_group}'.
-       В таблице колледжа ячейка одной пары (No ур.) очень часто разделена на ДВЕ СТРОКИ текста:
-       - ВЕРХНЯЯ СТРОКА текста = 1-я подгруппа (subgroup: 1).
-       - НИЖНЯЯ СТРОКА текста = 2-я подгруппа (subgroup: 2).
-       - Колонки 'Ауд' и 'Преподаватель' точно так же содержат верхнюю строку (для 1-й подгруппы) и нижнюю строку (для 2-й подгруппы).
+    3. ВНИМАТЕЛЬНО изучи каждую пару (колонка 'No ур') для группы '{target_group}'.
 
-       Важные правила подгрупп:
-       - Если в ячейке пары две разные строки (например, сверху 'ИнженерГрафика', ауд 306, а снизу 'ИнЯзык', ауд 308) — это ОБЯЗАТЕЛЬНО две разные записи: первая с subgroup: 1, вторая с subgroup: 2!
-       - Если в ячейке пары один и тот же предмет написан в две строки (например, 'ТехнологияПО' сверху и 'ТехнологияПО' снизу) — это тоже деление на подгруппы: сделай две записи с subgroup: 1 и subgroup: 2.
-       - Если по физкультуре указана 'ФизичКультура' и 'СМГ' (или два преподавателя) — раздели на subgroup: 1 ('ФизичКультура') и subgroup: 2 ('СМГ').
-       - Только если предмет и кабинет строго в одну строку на всю ширину и высоту ячейки (например, 'ЗащитаНаселен') — ставь subgroup: 0 (вся группа).
+    ПРАВИЛА ОПРЕДЕЛЕНИЯ ПОДГРУПП И ПРЕДМЕТОВ:
+    В бланке расписания для каждой пары (No ур) отведено до двух строк текста.
 
-       Собери уроки:
-       - lesson_num: номер пары (1-8).
-       - subgroup: 0 (вся группа), 1 (1 подгруппа / верхняя строка), 2 (2 подгруппа / нижняя строка).
-       - subject: название предмета.
-       - auditorium: номер кабинета (строка, или пустая строка если нет).
-       - teacher: преподаватель (строка, или пустая строка если нет).
+    А. КОГДА ЭТО ДЕЛЕНИЕ НА ПОДГРУППЫ (subgroup: 1 и subgroup: 2):
+    Пара делится на подгруппы ТОЛЬКО внутри ОДНОГО И ТОГО ЖЕ номера пары (одной ячейки 'No ур'), если:
+    1) В ячейке указаны ДВА РАЗНЫХ предмета (например: сверху 'ИнженерГрафика' ауд 306 БазарноваОФ, снизу 'ИнЯзык' ауд 308 АгарковаВЮ).
+       -> Создай ДВЕ записи для этого номера пары:
+          - верхняя строка: subgroup: 1
+          - нижняя строка: subgroup: 2
+    2) ИЛИ указан один предмет, но ДВА РАЗНЫХ кабинета и/или РАЗНЫХ преподавателя (например: две разные языковые группы).
+       -> Создай ДВЕ записи: верхняя строка subgroup: 1, нижняя строка subgroup: 2.
+    3) ИЛИ по физкультуре: сверху 'ФизичКультура' (subgroup: 1), снизу 'СМГ' или 'СМГ6' (subgroup: 2).
+       ВАЖНО: 'СМГ' / 'СМГ6' — это название спецмедгруппы (subject: 'СМГ' или 'СМГ6'), а НЕ номер кабинета! Кабинет для физкультуры и СМГ обычно не указан (auditorium: ''). Преподаватели у них разные (например ДазуринаВВ и ДугинаАГ).
+
+    Б. КОГДА ЭТО ВСЯ ГРУППА (subgroup: 0):
+    - Если предмет, кабинет и преподаватель одинаковые (или напечатаны в две строки одинаково, например: 'ТехнологияПО 410 УстьянСА' сверху и 'ТехнологияПО 410 УстьянСА' снизу) — это ОДИН урок для ВСЕЙ ГРУППЫ! Делай ровно ОДНУ запись с subgroup: 0. НЕ ДЕЛИ НА ПОДГРУППЫ!
+    - Если предмет напечатан в одну строку (например: 'МАТЕМАТИКА (пк)', 'Стандартизация', 'ЗащитаНаселен') — это subgroup: 0.
+    - Если у пары один предмет и один преподаватель (даже если фамилия преподавателя указана дважды или ячейка высокая, как 'Сидоркова' на 3 паре и на 4 паре) — это ВСЯ ГРУППА (subgroup: 0).
+    - ВНИМАНИЕ: Разные номера пар (например, 3 пара 'Арифм-ЛогиствТ' и 4 пара 'Арифм-ЛогиствТ', или 5 и 6 пары 'ТехнологияПО', или 6, 7, 8 пара 'Астрономия') — это ОТДЕЛЬНЫЕ самостоятельные уроки для ВСЕЙ ГРУППЫ (каждый урок с subgroup: 0)! КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ставить одну пару как подгруппу 1, а следующую пару как подгруппу 2!
+    - В ячейке, где нет деления на 2 подгруппы, ВСЕГДА ставь subgroup: 0. Запрещено ставить subgroup: 1, если у этой пары нет subgroup: 2!
 
     Ответ СТРОГО валидным JSON:
     {{
@@ -239,7 +282,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         "lessons": [
             {{
                 "lesson_num": 1,
-                "subgroup": 1,
+                "subgroup": 0,
                 "subject": "Название",
                 "auditorium": "304",
                 "teacher": "Иванов"
@@ -247,7 +290,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         ]
     }}
     """
-    models_to_try = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite']
+    models_to_try = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite']
 
     for model_name in models_to_try:
         for attempt in range(2):  # Делаем 2 попытки на модель при сетевых сбоях
