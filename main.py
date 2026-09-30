@@ -1,10 +1,12 @@
 import asyncio
+import io
 import json
 import logging
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from PIL import Image
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -244,62 +246,279 @@ async def save_schedule_for_date(target_date: str, lessons: list[dict]):
     logger.info(f"✅ Расписание на {target_date} успешно сохранено/перезаписано в БД ({len(clean_lessons)} уроков).")
 
 
-# --- РАСПОЗНАВАНИЕ ЧЕРЕЗ GEMINI (С RETRY И FALLBACK) ---
+# --- РАСПОЗНАВАНИЕ ЧЕРЕЗ GEMINI (С КАДРИРОВАНИЕМ И НОРМАЛИЗАЦИЕЙ) ---
+
+def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
+    """Обрезает и масштабирует область расписания группы для повышения точности OCR."""
+    im = Image.open(io.BytesIO(image_bytes))
+    w, h = im.size
+    ymin, xmin, ymax, xmax = box_2d
+    if ymax <= 1.0 and xmax <= 1.0 and (ymax > 0 or xmax > 0):
+        ymin, xmin, ymax, xmax = [int(v * 1000) for v in (ymin, xmin, ymax, xmax)]
+
+    # Колонки расписания колледжа: левая половина листа (~0..54%) или правая (~46..99%)
+    if xmin > 400:
+        actual_xmin = int(0.46 * w)
+        actual_xmax = int(0.99 * w)
+    else:
+        actual_xmin = int(0.01 * w)
+        actual_xmax = int(0.54 * w)
+
+    actual_ymin = max(0, int(ymin * h / 1000) - int(0.008 * h))
+    actual_ymax = min(h, int(ymax * h / 1000) + int(0.008 * h))
+
+    cropped = im.crop((actual_xmin, actual_ymin, actual_xmax, actual_ymax))
+    large = cropped.resize((cropped.width * 2, cropped.height * 2), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    large.save(out, format="JPEG", quality=95)
+    return out.getvalue()
+
+
+def rows_to_lessons(rows: list[dict]) -> list[dict]:
+    """Детерминированно преобразует физические строки таблицы в структуру уроков колледжа."""
+    lessons_by_num: dict[int, list[dict]] = {}
+    curr_num = None
+
+    for r in rows:
+        col_val = r.get("lesson_num_col")
+        if col_val is not None:
+            try:
+                val_str = str(col_val).strip().split()[0]
+                curr_num = int(val_str)
+            except (ValueError, TypeError, IndexError):
+                pass
+        if curr_num is not None:
+            subj = str(r.get("subject", "") or "").strip()
+            aud = str(r.get("auditorium", "") or "").strip()
+            teach = str(r.get("teacher", "") or "").strip()
+            if aud.lower().startswith("смг"):
+                aud = ""
+            if subj and subj != "-" and subj.lower() != "нет":
+                lessons_by_num.setdefault(curr_num, []).append({
+                    "subject": subj,
+                    "auditorium": aud,
+                    "teacher": teach
+                })
+
+    result = []
+    for l_num, items in sorted(lessons_by_num.items()):
+        if not items:
+            continue
+        if len(items) == 1:
+            result.append({
+                "lesson_num": l_num,
+                "subgroup": 0,
+                "subject": items[0]["subject"],
+                "auditorium": items[0]["auditorium"],
+                "teacher": items[0]["teacher"]
+            })
+        else:
+            it1 = items[0]
+            it2 = items[1]
+
+            # 1. Проверяем физкультуру и спецмедгруппу (СМГ)
+            is_fiz = (
+                any("физич" in it["subject"].lower() or "физ" in it["subject"].lower() for it in items) or
+                any("смг" in it["subject"].lower() or "смг" in it["auditorium"].lower() for it in items)
+            )
+            if is_fiz:
+                s1 = it1["subject"] if "смг" not in it1["subject"].lower() else "ФизичКультура"
+                s2 = it2["subject"] if "смг" in it2["subject"].lower() else "СМГ"
+                result.append({"lesson_num": l_num, "subgroup": 1, "subject": s1, "auditorium": "", "teacher": it1["teacher"]})
+                result.append({"lesson_num": l_num, "subgroup": 2, "subject": s2, "auditorium": "", "teacher": it2["teacher"]})
+                continue
+
+            # 2. Проверяем дубликат строки для всей группы (одинаковый предмет, кабинет и преподаватель)
+            same_subj = it1["subject"].lower() == it2["subject"].lower()
+            same_aud = it1["auditorium"] == it2["auditorium"]
+            same_teach = (not it1["teacher"] or not it2["teacher"] or it1["teacher"].lower() == it2["teacher"].lower())
+
+            if same_subj and same_aud and same_teach:
+                result.append({
+                    "lesson_num": l_num,
+                    "subgroup": 0,
+                    "subject": it1["subject"],
+                    "auditorium": it1["auditorium"],
+                    "teacher": it1["teacher"] or it2["teacher"]
+                })
+            else:
+                # 3. Деление на подгруппы (разные предметы или разные кабинеты/учителя)
+                for idx, it in enumerate(items[:2], start=1):
+                    result.append({
+                        "lesson_num": l_num,
+                        "subgroup": idx,
+                        "subject": it["subject"],
+                        "auditorium": it["auditorium"],
+                        "teacher": it["teacher"]
+                    })
+    return result
+
 
 def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date: str | None = None) -> dict:
-    prompt = f"""
-    Проанализируй фото расписания колледжа.
-    1. Найди дату в заголовке листа (например: '25.09.26г.'). 
-       Преобразуй её в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
-    2. Найди в таблице целевую группу '{target_group}'. Если группы нет, верни group_found: false.
-    3. ВНИМАТЕЛЬНО изучи каждую пару (колонка 'No ур') для группы '{target_group}'.
+    models_to_try = [
+        "gemini-3-flash-preview",
+        "gemini-3.5-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash",
+    ]
 
-    ПРАВИЛА ОПРЕДЕЛЕНИЯ ПОДГРУПП И ПРЕДМЕТОВ:
-    В бланке расписания для каждой пары (No ур) отведено до двух строк текста.
-
-    А. КОГДА ЭТО ДЕЛЕНИЕ НА ПОДГРУППЫ (subgroup: 1 и subgroup: 2):
-    Пара делится на подгруппы ТОЛЬКО внутри ОДНОГО И ТОГО ЖЕ номера пары (одной ячейки 'No ур'), если:
-    1) В ячейке указаны ДВА РАЗНЫХ предмета (например: сверху 'ИнженерГрафика' ауд 306 БазарноваОФ, снизу 'ИнЯзык' ауд 308 АгарковаВЮ).
-       -> Создай ДВЕ записи для этого номера пары:
-          - верхняя строка: subgroup: 1
-          - нижняя строка: subgroup: 2
-    2) ИЛИ указан один предмет, но ДВА РАЗНЫХ кабинета и/или РАЗНЫХ преподавателя (например: две разные языковые группы).
-       -> Создай ДВЕ записи: верхняя строка subgroup: 1, нижняя строка subgroup: 2.
-    3) ИЛИ по физкультуре: сверху 'ФизичКультура' (subgroup: 1), снизу 'СМГ' или 'СМГ6' (subgroup: 2).
-       ВАЖНО: 'СМГ' / 'СМГ6' — это название спецмедгруппы (subject: 'СМГ' или 'СМГ6'), а НЕ номер кабинета! Кабинет для физкультуры и СМГ обычно не указан (auditorium: ''). Преподаватели у них разные (например ДазуринаВВ и ДугинаАГ).
-
-    Б. КОГДА ЭТО ВСЯ ГРУППА (subgroup: 0):
-    - Если предмет, кабинет и преподаватель одинаковые (или напечатаны в две строки одинаково, например: 'ТехнологияПО 410 УстьянСА' сверху и 'ТехнологияПО 410 УстьянСА' снизу) — это ОДИН урок для ВСЕЙ ГРУППЫ! Делай ровно ОДНУ запись с subgroup: 0. НЕ ДЕЛИ НА ПОДГРУППЫ!
-    - Если предмет напечатан в одну строку (например: 'МАТЕМАТИКА (пк)', 'Стандартизация', 'ЗащитаНаселен') — это subgroup: 0.
-    - Если у пары один предмет и один преподаватель (даже если фамилия преподавателя указана дважды или ячейка высокая, как 'Сидоркова' на 3 паре и на 4 паре) — это ВСЯ ГРУППА (subgroup: 0).
-    - ВНИМАНИЕ: Разные номера пар (например, 3 пара 'Арифм-ЛогиствТ' и 4 пара 'Арифм-ЛогиствТ', или 5 и 6 пары 'ТехнологияПО', или 6, 7, 8 пара 'Астрономия') — это ОТДЕЛЬНЫЕ самостоятельные уроки для ВСЕЙ ГРУППЫ (каждый урок с subgroup: 0)! КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО ставить одну пару как подгруппу 1, а следующую пару как подгруппу 2!
-    - В ячейке, где нет деления на 2 подгруппы, ВСЕГДА ставь subgroup: 0. Запрещено ставить subgroup: 1, если у этой пары нет subgroup: 2!
-
-    Ответ СТРОГО валидным JSON:
+    prompt_stage1 = f"""
+    Найди дату расписания в заголовке листа колледжа (например '25.09.26г.') и границы блока расписания целевой группы '{target_group}'.
+    Преобразуй дату в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
+    Блок группы включает строку с названием группы и все строки уроков под ней до следующей группы или конца таблицы.
+    Если группы нет на листе, верни group_found: false.
+    
+    Верни строго JSON:
     {{
         "date": "YYYY-MM-DD" или null,
         "group_found": true/false,
-        "lessons": [
-            {{
-                "lesson_num": 1,
-                "subgroup": 0,
-                "subject": "Название",
-                "auditorium": "304",
-                "teacher": "Иванов"
-            }}
-        ]
+        "box_2d": [ymin, xmin, ymax, xmax]
     }}
     """
-    models_to_try = ['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.8-flash', 'gemini-3.5-flash-lite']
 
+    stage1_result = None
     for model_name in models_to_try:
-        for attempt in range(2):  # Делаем 2 попытки на модель при сетевых сбоях
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=[
+                    genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    prompt_stage1
+                ],
+                config=genai_types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1
+                )
+            )
+            text = response.text
+            if not text:
+                continue
+            text = text.strip()
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            stage1_result = json.loads(text)
+            if stage1_result:
+                break
+        except Exception as e:
+            err_str = str(e)
+            if "503" in err_str or "UNAVAILABLE" in err_str:
+                logger.warning(f"Сервер перегружен (503) на {model_name} в Stage 1. Пробуем следующую модель...")
+                continue
+            elif "429" in err_str:
+                logger.warning(f"Лимит 429 на {model_name} в Stage 1. Пробуем следующую модель...")
+                continue
+            else:
+                logger.warning(f"Ошибка {model_name} в Stage 1: {e}")
+                continue
+
+    if not stage1_result:
+        return {}
+
+    detected_date = stage1_result.get("date") or fallback_date
+    if not stage1_result.get("group_found"):
+        logger.info(f"Группа {target_group} не найдена на листе расписания (дата: {detected_date}).")
+        return {"date": detected_date, "group_found": False, "lessons": []}
+
+    box_2d = stage1_result.get("box_2d")
+    lessons = []
+
+    # Stage 2: Распознавание на кропе высокого разрешения
+    if box_2d and isinstance(box_2d, (list, tuple)) and len(box_2d) == 4:
+        try:
+            crop_bytes = crop_group_image(image_bytes, box_2d)
+            prompt_stage2 = f"""
+            На изображении представлена часть таблицы расписания группы '{target_group}'.
+            1. Найди в левом столбце ячейку с названием группы '{target_group}'.
+            2. Определи ВСЕ физические строки текста, принадлежащие группе '{target_group}' (между верхней и нижней границей ячейки '{target_group}'). Игнорируй другие группы.
+            3. Внимательно прочитай КАЖДУЮ физическую строку сверху вниз:
+               - lesson_num_col: цифра из колонки 'No ур' на этой строке (например 1, 2, 3, 4, 5, 6, 7, 8), либо null, если в колонке 'No ур' пусто.
+               - subject: название предмета на этой строке
+               - auditorium: кабинет (или пустая строка)
+               - teacher: преподаватель (или пустая строка)
+
+            Ответ строго в JSON:
+            {{
+              "rows": [
+                {{"lesson_num_col": 2, "subject": "...", "auditorium": "...", "teacher": "..."}}
+              ]
+            }}
+            """
+
+            for model_name in models_to_try:
+                try:
+                    response = ai_client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            genai_types.Part.from_bytes(data=crop_bytes, mime_type="image/jpeg"),
+                            prompt_stage2
+                        ],
+                        config=genai_types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.1
+                        )
+                    )
+                    text = response.text
+                    if not text:
+                        continue
+                    text = text.strip()
+                    if text.startswith("```"):
+                        lines = text.splitlines()
+                        if lines and lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        text = "\n".join(lines).strip()
+                    d2 = json.loads(text)
+                    rows = d2.get("rows", [])
+                    if rows:
+                        lessons = rows_to_lessons(rows)
+                        logger.info(f"✅ Stage 2 успешно извлек {len(lessons)} уроков для {target_group} через {model_name}.")
+                        break
+                except Exception as e:
+                    err_str = str(e)
+                    if "503" in err_str or "UNAVAILABLE" in err_str:
+                        logger.warning(f"Сервер перегружен (503) на {model_name} в Stage 2. Пробуем следующую модель...")
+                        continue
+                    elif "429" in err_str:
+                        logger.warning(f"Лимит 429 на {model_name} в Stage 2. Пробуем следующую модель...")
+                        continue
+                    else:
+                        logger.warning(f"Ошибка {model_name} в Stage 2: {e}")
+                        continue
+        except Exception as e:
+            logger.error(f"Ошибка кадрирования изображения в Stage 2: {e}")
+
+    # Fallback на прямое распознавание полного листа, если кроп не удался или не дал уроков
+    if not lessons:
+        logger.warning("Stage 2 не вернул уроков, запускаем fallback на распознавание всего листа...")
+        prompt_fallback = f"""
+        Проанализируй фото расписания колледжа.
+        1. Найди в таблице целевую группу '{target_group}'.
+        2. Изучи каждую пару (колонка 'No ур') для группы '{target_group}'.
+        3. Если внутри одной пары два разных предмета или два разных кабинета/преподавателя — это подгруппы 1 и 2.
+        4. Если физкультура и СМГ — это подгруппы 1 и 2, кабинет пустой.
+        5. Если предмет и кабинет одинаковые — это вся группа (subgroup: 0).
+
+        Ответ в JSON:
+        {{
+            "lessons": [
+                {{"lesson_num": 1, "subgroup": 0, "subject": "...", "auditorium": "...", "teacher": "..."}}
+            ]
+        }}
+        """
+        for model_name in models_to_try:
             try:
                 response = ai_client.models.generate_content(
                     model=model_name,
                     contents=[
-                        genai_types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'),
-                        prompt
+                        genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        prompt_fallback
                     ],
                     config=genai_types.GenerateContentConfig(
                         response_mime_type="application/json",
@@ -308,32 +527,19 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                 )
                 text = response.text
                 if not text:
-                    logger.warning(f"Пустой ответ от {model_name}.")
                     continue
-                text = text.strip()
-                if text.startswith("```"):
-                    lines = text.splitlines()
-                    if lines and lines[0].startswith("```"):
-                        lines = lines[1:]
-                    if lines and lines[-1].startswith("```"):
-                        lines = lines[:-1]
-                    text = "\n".join(lines).strip()
-                return json.loads(text)
-            except Exception as e:
-                err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    logger.warning(f"Сервер перегружен (503) на {model_name} (попытка {attempt+1}/2). Ждем 3 сек...")
-                    time.sleep(3)
-                    continue
-                elif "429" in err_str:
-                    logger.warning(f"Лимит 429 на {model_name}. Пробуем следующую модель...")
-                    time.sleep(2)
-                    break  # Выходим на следующую модель из списка
-                else:
-                    logger.error(f"Ошибка {model_name}: {e}")
-                    break  # Переходим к следующей модели
+                d_fb = json.loads(text)
+                lessons = d_fb.get("lessons", [])
+                if lessons:
+                    break
+            except Exception:
+                continue
 
-    return {}
+    return {
+        "date": detected_date,
+        "group_found": True,
+        "lessons": lessons
+    }
 
 
 async def process_photo_message(msg, fallback_date: str | None = None) -> str | None:
