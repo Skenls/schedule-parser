@@ -274,44 +274,47 @@ def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
     return out.getvalue()
 
 
-def rows_to_lessons(rows: list[dict]) -> list[dict]:
-    """Детерминированно преобразует физические строки таблицы в структуру уроков колледжа."""
-    lessons_by_num: dict[int, list[dict]] = {}
-    curr_num = None
+def normalize_parsed_lessons(lessons: list[dict]) -> list[dict]:
+    """Детерминированно очищает, объединяет дубликаты и нормализует подгруппы уроков."""
+    by_num: dict[int, list[dict]] = {}
+    for l in lessons:
+        try:
+            num = int(l.get("lesson_num", 0))
+        except (ValueError, TypeError):
+            continue
+        if num < 1 or num > 10:
+            continue
+        subj = str(l.get("subject", "") or "").strip()
+        aud = str(l.get("auditorium", "") or "").strip()
+        teach = str(l.get("teacher", "") or "").strip()
+        sub = l.get("subgroup", 0)
+        try:
+            sub = int(sub)
+        except (ValueError, TypeError):
+            sub = 0
 
-    for r in rows:
-        col_val = r.get("lesson_num_col")
-        if col_val is not None:
-            try:
-                val_str = str(col_val).strip().split()[0]
-                curr_num = int(val_str)
-            except (ValueError, TypeError, IndexError):
-                pass
-        if curr_num is not None:
-            subj = str(r.get("subject", "") or "").strip()
-            aud = str(r.get("auditorium", "") or "").strip()
-            teach = str(r.get("teacher", "") or "").strip()
-            if aud.lower().startswith("смг"):
-                aud = ""
-            if subj and subj != "-" and subj.lower() != "нет":
-                lessons_by_num.setdefault(curr_num, []).append({
-                    "subject": subj,
-                    "auditorium": aud,
-                    "teacher": teach
-                })
+        if aud.lower().startswith("смг"):
+            aud = ""
+        if "смг" in subj.lower():
+            aud = ""
+            sub = 2
+
+        if subj and subj != "-" and subj.lower() != "нет":
+            by_num.setdefault(num, []).append({
+                "lesson_num": num,
+                "subgroup": sub,
+                "subject": subj,
+                "auditorium": aud,
+                "teacher": teach
+            })
 
     result = []
-    for l_num, items in sorted(lessons_by_num.items()):
+    for num, items in sorted(by_num.items()):
         if not items:
             continue
         if len(items) == 1:
-            result.append({
-                "lesson_num": l_num,
-                "subgroup": 0,
-                "subject": items[0]["subject"],
-                "auditorium": items[0]["auditorium"],
-                "teacher": items[0]["teacher"]
-            })
+            items[0]["subgroup"] = 0
+            result.append(items[0])
         else:
             it1 = items[0]
             it2 = items[1]
@@ -319,13 +322,13 @@ def rows_to_lessons(rows: list[dict]) -> list[dict]:
             # 1. Проверяем физкультуру и спецмедгруппу (СМГ)
             is_fiz = (
                 any("физич" in it["subject"].lower() or "физ" in it["subject"].lower() for it in items) or
-                any("смг" in it["subject"].lower() or "смг" in it["auditorium"].lower() for it in items)
+                any("смг" in it["subject"].lower() for it in items)
             )
             if is_fiz:
                 s1 = it1["subject"] if "смг" not in it1["subject"].lower() else "ФизичКультура"
                 s2 = it2["subject"] if "смг" in it2["subject"].lower() else "СМГ"
-                result.append({"lesson_num": l_num, "subgroup": 1, "subject": s1, "auditorium": "", "teacher": it1["teacher"]})
-                result.append({"lesson_num": l_num, "subgroup": 2, "subject": s2, "auditorium": "", "teacher": it2["teacher"]})
+                result.append({"lesson_num": num, "subgroup": 1, "subject": s1, "auditorium": "", "teacher": it1["teacher"]})
+                result.append({"lesson_num": num, "subgroup": 2, "subject": s2, "auditorium": "", "teacher": it2["teacher"]})
                 continue
 
             # 2. Проверяем дубликат строки для всей группы (одинаковый предмет, кабинет и преподаватель)
@@ -335,29 +338,26 @@ def rows_to_lessons(rows: list[dict]) -> list[dict]:
 
             if same_subj and same_aud and same_teach:
                 result.append({
-                    "lesson_num": l_num,
+                    "lesson_num": num,
                     "subgroup": 0,
                     "subject": it1["subject"],
                     "auditorium": it1["auditorium"],
                     "teacher": it1["teacher"] or it2["teacher"]
                 })
             else:
-                # 3. Деление на подгруппы (разные предметы или разные кабинеты/учителя)
-                for idx, it in enumerate(items[:2], start=1):
-                    result.append({
-                        "lesson_num": l_num,
-                        "subgroup": idx,
-                        "subject": it["subject"],
-                        "auditorium": it["auditorium"],
-                        "teacher": it["teacher"]
-                    })
+                # 3. Деление на подгруппы (разные кабинеты, преподаватели или предметы)
+                it1["subgroup"] = 1
+                it2["subgroup"] = 2
+                result.append(it1)
+                result.append(it2)
+
     return result
 
 
 def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date: str | None = None) -> dict:
     models_to_try = [
-        "gemini-3-flash-preview",
         "gemini-3.5-flash-lite",
+        "gemini-3-flash-preview",
         "gemini-flash-lite-latest",
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash",
@@ -433,19 +433,31 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         try:
             crop_bytes = crop_group_image(image_bytes, box_2d)
             prompt_stage2 = f"""
-            На изображении представлена часть таблицы расписания группы '{target_group}'.
-            1. Найди в левом столбце ячейку с названием группы '{target_group}'.
-            2. Определи ВСЕ физические строки текста, принадлежащие группе '{target_group}' (между верхней и нижней границей ячейки '{target_group}'). Игнорируй другие группы.
-            3. Внимательно прочитай КАЖДУЮ физическую строку сверху вниз:
-               - lesson_num_col: цифра из колонки 'No ур' на этой строке (например 1, 2, 3, 4, 5, 6, 7, 8), либо null, если в колонке 'No ур' пусто.
-               - subject: название предмета на этой строке
-               - auditorium: кабинет (или пустая строка)
-               - teacher: преподаватель (или пустая строка)
+            На увеличенном изображении представлена часть таблицы расписания колледжа для группы '{target_group}'.
+            Найди в левом столбце ячейку с названием группы '{target_group}'.
+            Читай уроки ТОЛЬКО группы '{target_group}' (между верхней и нижней границей ячейки '{target_group}'). Игнорируй строки других групп выше или ниже.
 
-            Ответ строго в JSON:
+            В колонке 'No ур' написаны цифры пар (номера уроков).
+            Внимательно изучи КАЖДЫЙ номер пары для группы '{target_group}':
+
+            ПРАВИЛА ОПРЕДЕЛЕНИЯ ПОДГРУПП:
+            1. ДЕЛЕНИЕ НА ПОДГРУППЫ (subgroup: 1 и subgroup: 2):
+               Пара делится на 2 подгруппы, если внутри одной пары указано:
+               - ДВА РАЗНЫХ кабинета (например кабинет 310 и кабинет 515) или два разных преподавателя
+               - ИЛИ два разных предмета (например ИнженерГрафика и ИнЯзык)
+               - ИЛИ по физкультуре: сверху 'ФизичКультура' (subgroup: 1), снизу 'СМГ' или 'СМГ6' (subgroup: 2). Кабинет у физкультуры и СМГ пустой (auditorium: '').
+               -> Создай ДВЕ записи для этого номера пары:
+                  верхняя строка: subgroup: 1
+                  нижняя строка: subgroup: 2
+
+            2. ВСЯ ГРУППА (subgroup: 0):
+               - Если пара напечатана в одну строку — это вся группа (subgroup: 0).
+               - Если пара напечатана одинаково в две строки (один и тот же предмет, один кабинет и один преподаватель) — это ОДИН урок для ВСЕЙ группы (subgroup: 0). Не дели на подгруппы!
+
+            Ответ строго валидным JSON:
             {{
-              "rows": [
-                {{"lesson_num_col": 2, "subject": "...", "auditorium": "...", "teacher": "..."}}
+              "lessons": [
+                {{"lesson_num": 2, "subgroup": 1, "subject": "...", "auditorium": "...", "teacher": "..."}}
               ]
             }}
             """
@@ -475,9 +487,9 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                             lines = lines[:-1]
                         text = "\n".join(lines).strip()
                     d2 = json.loads(text)
-                    rows = d2.get("rows", [])
-                    if rows:
-                        lessons = rows_to_lessons(rows)
+                    raw_lessons = d2.get("lessons", [])
+                    if raw_lessons:
+                        lessons = normalize_parsed_lessons(raw_lessons)
                         logger.info(f"✅ Stage 2 успешно извлек {len(lessons)} уроков для {target_group} через {model_name}.")
                         break
                 except Exception as e:
@@ -529,8 +541,9 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                 if not text:
                     continue
                 d_fb = json.loads(text)
-                lessons = d_fb.get("lessons", [])
-                if lessons:
+                raw_fb = d_fb.get("lessons", [])
+                if raw_fb:
+                    lessons = normalize_parsed_lessons(raw_fb)
                     break
             except Exception:
                 continue
@@ -602,11 +615,15 @@ async def sync_schedule_if_needed(force: bool = False) -> list[str]:
                 if parsed_date not in updated_dates:
                     updated_dates.append(parsed_date)
 
-                if parsed_date == today_str and not force:
+                if parsed_date == today_str:
                     logger.info(f"🎉 Расписание на сегодня ({today_str}) успешно найдено и загружено!")
                     break
 
-                if parsed_date > today_str and not force:
+                if parsed_date < today_str:
+                    logger.info(f"Встречен лист за прошлый день ({parsed_date}). Прекращаем поиск.")
+                    break
+
+                if parsed_date > today_str:
                     logger.info(f"Сохранен лист на будущее ({parsed_date}). Продолжаем поиск сегодняшнего...")
 
         return updated_dates
@@ -649,6 +666,10 @@ async def sync_nextday_schedule() -> tuple[bool, str, str]:
                 if parsed_date == today_str:
                     logger.info(f"Встречен лист на сегодня ({today_str}). Листа на следующий день ({next_date_str}) ещё нет.")
                     return False, next_date_str, today_str
+
+                if parsed_date < today_str:
+                    logger.info(f"Встречен лист за прошлый день ({parsed_date}). Листа на следующий день ({next_date_str}) нет.")
+                    return False, next_date_str, parsed_date
 
         return False, next_date_str, ""
 
