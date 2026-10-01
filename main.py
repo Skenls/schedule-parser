@@ -298,6 +298,10 @@ def normalize_parsed_lessons(lessons: list[dict]) -> list[dict]:
         if "смг" in subj.lower():
             aud = ""
             sub = 2
+        if "технологиядо" in subj.lower():
+            subj = "ТехнологияПО"
+        if subj.lower() == "защитакомпинфм":
+            subj = "ЗащитаКомпИнф"
 
         if subj and subj != "-" and subj.lower() != "нет":
             by_num.setdefault(num, []).append({
@@ -364,13 +368,17 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     ]
 
     prompt_stage1 = f"""
-    Найди дату расписания в заголовке листа колледжа (например '25.09.26г.') и границы блока расписания целевой группы '{target_group}'.
+    Найди дату расписания в заголовке листа колледжа (например '25.09.26г.') и координаты блока расписания целевой группы '{target_group}'.
     Преобразуй дату в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
-    Блок группы включает строку с названием группы и все строки уроков под ней до следующей группы или конца таблицы.
+    Таблица состоит из двух колонок: левая половина листа и правая половина листа.
+    Внимательно просмотри обе колонки сверху вниз.
     
-    КРИТИЧЕСКИ ВАЖНО: Ищи СТРОГО целевую группу '{target_group}'!
-    НЕ ПУТАЙ с похожими группами (например '10П', '8П', '9П', '110б', '100б' и т.д. — это ДРУГИЕ группы)!
-    Если на листе представлена похожая группа (например '10П'), но нет СТРОГО '{target_group}', верни group_found: false!
+    КРИТИЧЕСКИ ВАЖНО: Ищи СТРОГО целевую группу '{target_group}' (две единицы: 1-1-П)!
+    В таблице присутствуют параллельные группы со схожими номерами: '14П' (четырнадцать), '13П' (тринадцать), '12П' (двенадцать), '10П' (десять).
+    НЕ ПУТАЙ '{target_group}' с '14П', '13П', '12П', '10П', '8П', '9П'!
+    Убедись, что первая цифра 1 и вторая цифра 1 (11П).
+    Если группа '{target_group}' найдена, укажи box_2d: [ymin, xmin, ymax, xmax] — от ячейки с названием группы до разделительной черты перед следующей группой.
+    Если на листе представлены только другие группы (например '14П', '10П' и т.д.), но нет СТРОГО '{target_group}', верни group_found: false.
     
     Верни строго JSON:
     {{
@@ -502,10 +510,82 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                         text = "\n".join(lines).strip()
                     d2 = json.loads(text)
                     if d2.get("group_matched") is False:
+                        wrong_grp = d2.get("detected_group", "")
                         logger.warning(
-                            f"Кроп содержит группу '{d2.get('detected_group')}', а не '{target_group}'. Отклоняем лист."
+                            f"Кроп содержит группу '{wrong_grp}', а не '{target_group}'. Запускаем повторный поиск целевой группы..."
                         )
-                        return {"date": detected_date, "group_found": False, "lessons": []}
+                        prompt_retry_stage1 = f"""
+                        Найди дату расписания в заголовке листа колледжа и координаты блока расписания целевой группы '{target_group}'.
+                        Преобразуй дату в ISO формат: 'YYYY-MM-DD'.
+
+                        ВНИМАНИЕ: Ранее был ошибочно выбран блок группы '{wrong_grp}'!
+                        Целевая группа — СТРОГО '{target_group}' (две единицы: 1-1-П)!
+                        Проверь противоположную колонку (левую или правую) и другие строки таблицы.
+                        Если группа '{target_group}' есть на листе, укажи её координаты box_2d: [ymin, xmin, ymax, xmax].
+                        Если на листе группы '{target_group}' нет, верни group_found: false.
+
+                        Верни строго JSON:
+                        {{
+                            "date": "YYYY-MM-DD" или null,
+                            "group_found": true/false,
+                            "box_2d": [ymin, xmin, ymax, xmax]
+                        }}
+                        """
+                        try:
+                            res_ret = ai_client.models.generate_content(
+                                model=model_name,
+                                contents=[
+                                    genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                                    prompt_retry_stage1
+                                ],
+                                config=genai_types.GenerateContentConfig(
+                                    response_mime_type="application/json",
+                                    temperature=0.1
+                                )
+                            )
+                            t_ret = res_ret.text.strip()
+                            if t_ret.startswith("```"):
+                                lines_r = t_ret.splitlines()
+                                if lines_r and lines_r[0].startswith("```"):
+                                    lines_r = lines_r[1:]
+                                if lines_r and lines_r[-1].startswith("```"):
+                                    lines_r = lines_r[:-1]
+                                t_ret = "\n".join(lines_r).strip()
+                            d_ret = json.loads(t_ret)
+                            if d_ret.get("group_found") and d_ret.get("box_2d"):
+                                crop_bytes_ret = crop_group_image(image_bytes, d_ret["box_2d"])
+                                res2_ret = ai_client.models.generate_content(
+                                    model=model_name,
+                                    contents=[
+                                        genai_types.Part.from_bytes(data=crop_bytes_ret, mime_type="image/jpeg"),
+                                        prompt_stage2
+                                    ],
+                                    config=genai_types.GenerateContentConfig(
+                                        response_mime_type="application/json",
+                                        temperature=0.1
+                                    )
+                                )
+                                t2_ret = res2_ret.text.strip()
+                                if t2_ret.startswith("```"):
+                                    lines_t2 = t2_ret.splitlines()
+                                    if lines_t2 and lines_t2[0].startswith("```"):
+                                        lines_t2 = lines_t2[1:]
+                                    if lines_t2 and lines_t2[-1].startswith("```"):
+                                        lines_t2 = lines_t2[:-1]
+                                    t2_ret = "\n".join(lines_t2).strip()
+                                d2_ret = json.loads(t2_ret)
+                                if d2_ret.get("group_matched") is not False:
+                                    raw_lessons = d2_ret.get("lessons", [])
+                                    if raw_lessons:
+                                        lessons = normalize_parsed_lessons(raw_lessons)
+                                        logger.info(f"✅ Stage 2 (после retry) успешно извлек {len(lessons)} уроков для {target_group}.")
+                                        break
+                        except Exception as e_ret:
+                            logger.warning(f"Ошибка при retry Stage 1: {e_ret}")
+
+                        if not lessons:
+                            logger.info(f"Группа {target_group} не найдена на листе расписания (дата: {detected_date}).")
+                            return {"date": detected_date, "group_found": False, "lessons": []}
                     raw_lessons = d2.get("lessons", [])
                     if raw_lessons:
                         lessons = normalize_parsed_lessons(raw_lessons)
