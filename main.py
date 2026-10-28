@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -266,7 +267,10 @@ def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
         # Модель вернула только название группы — добираем строку вправо.
         actual_xmax = min(w, actual_xmin + int(0.54 * w))
 
-    actual_ymin = max(0, int(ymin * h / 1000) - int(0.008 * h))
+    # Модель часто начинает bbox с последних уроков группы, а не с заголовка.
+    # Поднимаем верх кропа на высоту одной группы, иначе Stage 2 читает следующую
+    # группу (например, 1006 вместо 11П).
+    actual_ymin = max(0, int(ymin * h / 1000) - int(0.06 * h))
     actual_ymax = min(h, int(ymax * h / 1000) + int(0.005 * h))
 
     cropped = im.crop((actual_xmin, actual_ymin, actual_xmax, actual_ymax))
@@ -669,15 +673,37 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     }
 
 
+def parse_caption_date(text: str | None) -> str | None:
+    match = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b", text or "")
+    if not match:
+        return None
+    day, month, year = map(int, match.groups())
+    if year < 100:
+        year += 2000
+    try:
+        return datetime(year, month, day, tzinfo=TZ).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 async def process_photo_message(msg, fallback_date: str | None = None) -> str | None:
     """Скачивает фото и сохраняет расписание при обнаружении группы."""
     if not msg.photo:
         return None
 
     img_data = await msg.download_media(file=bytes)
-    result = await asyncio.to_thread(parse_image_with_gemini, img_data, config.TARGET_GROUP, fallback_date)
+    caption = getattr(msg, "message", None) or getattr(msg, "text", None)
+    caption_date = parse_caption_date(caption)
+    result = await asyncio.to_thread(
+        parse_image_with_gemini, img_data, config.TARGET_GROUP, caption_date or fallback_date
+    )
 
-    doc_date = result.get("date")
+    detected_date = result.get("date")
+    if caption_date and detected_date and detected_date != caption_date:
+        logger.warning(
+            f"Дата на листе {detected_date} не совпала с подписью поста {caption_date}. Использую подпись."
+        )
+    doc_date = caption_date or detected_date
     if not doc_date or not isinstance(doc_date, str):
         return None
 
