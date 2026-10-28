@@ -256,16 +256,18 @@ def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
     if ymax <= 1.0 and xmax <= 1.0 and (ymax > 0 or xmax > 0):
         ymin, xmin, ymax, xmax = [int(v * 1000) for v in (ymin, xmin, ymax, xmax)]
 
-    # Колонки расписания колледжа: левая половина листа (~0..54%) или правая (~46..99%)
-    if xmin > 400:
-        actual_xmin = int(0.46 * w)
-        actual_xmax = int(0.99 * w)
-    else:
-        actual_xmin = int(0.01 * w)
-        actual_xmax = int(0.54 * w)
+    # Режем от ячейки с названием группы вправо, а не фиксированную половину листа:
+    # 11П часто стоит ровно на границе x=400, и кроп захватывал соседнюю таблицу
+    # (188к/1006), из-за чего Stage 2 отвергал группу.
+    pad_x = max(4, int(0.01 * w))
+    actual_xmin = max(0, int(xmin * w / 1000) - pad_x)
+    actual_xmax = min(w, int(xmax * w / 1000) + pad_x)
+    if actual_xmax - actual_xmin < int(0.15 * w):
+        # Модель вернула только название группы — добираем строку вправо.
+        actual_xmax = min(w, actual_xmin + int(0.54 * w))
 
     actual_ymin = max(0, int(ymin * h / 1000) - int(0.008 * h))
-    actual_ymax = min(h, int(ymax * h / 1000) + int(0.02 * h))
+    actual_ymax = min(h, int(ymax * h / 1000) + int(0.005 * h))
 
     cropped = im.crop((actual_xmin, actual_ymin, actual_xmax, actual_ymax))
     large = cropped.resize((cropped.width * 2, cropped.height * 2), Image.Resampling.LANCZOS)
@@ -370,14 +372,19 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     prompt_stage1 = f"""
     Найди дату расписания в заголовке листа колледжа (например '25.09.26г.') и координаты блока расписания целевой группы '{target_group}'.
     Преобразуй дату в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
-    Таблица состоит из двух колонок: левая половина листа и правая половина листа.
-    Внимательно просмотри обе колонки сверху вниз.
+    Лист может состоять из нескольких таблиц (левая, средняя, правая часть листа).
+    Внимательно просмотри ВСЕ таблицы сверху вниз.
     
     КРИТИЧЕСКИ ВАЖНО: Ищи СТРОГО целевую группу '{target_group}' (две единицы: 1-1-П)!
     В таблице присутствуют параллельные группы со схожими номерами: '14П' (четырнадцать), '13П' (тринадцать), '12П' (двенадцать), '10П' (десять).
     НЕ ПУТАЙ '{target_group}' с '14П', '13П', '12П', '10П', '8П', '9П'!
     Убедись, что первая цифра 1 и вторая цифра 1 (11П).
-    Если группа '{target_group}' найдена, укажи box_2d: [ymin, xmin, ymax, xmax] — от ячейки с названием группы до разделительной черты перед следующей группой.
+    Если группа '{target_group}' найдена, верни box_2d: [ymin, xmin, ymax, xmax] строго вокруг блока ЭТОЙ группы:
+    - ymin — верхняя граница строки с названием группы;
+    - ymax — нижняя граница последнего урока этой группы (перед следующей группой);
+    - xmin — левая граница ячейки с названием группы;
+    - xmax — правая граница строки/таблицы этой группы.
+    Не включай в box_2d соседние группы.
     Если на листе представлены только другие группы (например '14П', '10П' и т.д.), но нет СТРОГО '{target_group}', верни group_found: false.
     
     Верни строго JSON:
@@ -437,6 +444,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         return {"date": detected_date, "group_found": False, "lessons": []}
 
     box_2d = stage1_result.get("box_2d")
+    logger.info(f"Stage 1 box_2d для {target_group} (дата: {detected_date}): {box_2d}")
     lessons = []
 
     # Stage 2: Распознавание на кропе высокого разрешения
@@ -520,8 +528,11 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
 
                         ВНИМАНИЕ: Ранее был ошибочно выбран блок группы '{wrong_grp}'!
                         Целевая группа — СТРОГО '{target_group}' (две единицы: 1-1-П)!
-                        Проверь противоположную колонку (левую или правую) и другие строки таблицы.
-                        Если группа '{target_group}' есть на листе, укажи её координаты box_2d: [ymin, xmin, ymax, xmax].
+                        Проверь ВСЕ таблицы на листе (левую, среднюю и правую часть) и другие строки.
+                        Если группа '{target_group}' есть на листе, укажи box_2d строго вокруг её блока:
+                        ymin — верх строки с названием группы, ymax — низ последнего урока этой группы,
+                        xmin — левая граница ячейки с названием, xmax — правая граница строки/таблицы.
+                        Не включай соседние группы.
                         Если на листе группы '{target_group}' нет, верни group_found: false.
 
                         Верни строго JSON:
