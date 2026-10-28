@@ -2,7 +2,6 @@ import asyncio
 import io
 import json
 import logging
-import re
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -249,6 +248,17 @@ async def save_schedule_for_date(target_date: str, lessons: list[dict]):
 
 # --- РАСПОЗНАВАНИЕ ЧЕРЕЗ GEMINI (С КАДРИРОВАНИЕМ И НОРМАЛИЗАЦИЕЙ) ---
 
+def crop_header_image(image_bytes: bytes) -> bytes:
+    """Увеличенная верхняя полоса листа — для точного чтения даты в заголовке."""
+    im = Image.open(io.BytesIO(image_bytes))
+    w, h = im.size
+    cropped = im.crop((0, 0, w, int(h * 0.3)))
+    large = cropped.resize((cropped.width * 2, cropped.height * 2), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    large.save(out, format="JPEG", quality=95)
+    return out.getvalue()
+
+
 def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
     """Обрезает и масштабирует область расписания группы для повышения точности OCR."""
     im = Image.open(io.BytesIO(image_bytes))
@@ -267,10 +277,7 @@ def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
         # Модель вернула только название группы — добираем строку вправо.
         actual_xmax = min(w, actual_xmin + int(0.54 * w))
 
-    # Модель часто начинает bbox с последних уроков группы, а не с заголовка.
-    # Поднимаем верх кропа на высоту одной группы, иначе Stage 2 читает следующую
-    # группу (например, 1006 вместо 11П).
-    actual_ymin = max(0, int(ymin * h / 1000) - int(0.06 * h))
+    actual_ymin = max(0, int(ymin * h / 1000) - int(0.008 * h))
     actual_ymax = min(h, int(ymax * h / 1000) + int(0.005 * h))
 
     cropped = im.crop((actual_xmin, actual_ymin, actual_xmax, actual_ymax))
@@ -364,7 +371,8 @@ def normalize_parsed_lessons(lessons: list[dict]) -> list[dict]:
     return result
 
 
-def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date: str | None = None) -> dict:
+def parse_image_with_gemini(image_bytes: bytes, target_group: str) -> dict:
+    header_bytes = crop_header_image(image_bytes)
     models_to_try = [
         "gemini-3.5-flash-lite",
         "gemini-3-flash-preview",
@@ -375,7 +383,8 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
 
     prompt_stage1 = f"""
     Найди дату расписания в заголовке листа колледжа (например '25.09.26г.') и координаты блока расписания целевой группы '{target_group}'.
-    Преобразуй дату в ISO формат: 'YYYY-MM-DD'. Если дата не видна или обрезана, используй подсказку: '{fallback_date or "null"}'.
+    Второе изображение — увеличенная верхняя часть этого же листа. Используй его ТОЛЬКО для чтения даты, координаты box_2d указывай по ПЕРВОМУ (полному) изображению.
+    Преобразуй дату в ISO формат: 'YYYY-MM-DD'. Если дата не видна или не читается, верни null. Не угадывай дату и не используй сегодняшнюю.
     Лист может состоять из нескольких таблиц (левая, средняя, правая часть листа).
     Внимательно просмотри ВСЕ таблицы сверху вниз.
     
@@ -383,12 +392,13 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     В таблице присутствуют параллельные группы со схожими номерами: '14П' (четырнадцать), '13П' (тринадцать), '12П' (двенадцать), '10П' (десять).
     НЕ ПУТАЙ '{target_group}' с '14П', '13П', '12П', '10П', '8П', '9П'!
     Убедись, что первая цифра 1 и вторая цифра 1 (11П).
-    Если группа '{target_group}' найдена, верни box_2d: [ymin, xmin, ymax, xmax] строго вокруг блока ЭТОЙ группы:
-    - ymin — верхняя граница строки с названием группы;
-    - ymax — нижняя граница последнего урока этой группы (перед следующей группой);
-    - xmin — левая граница ячейки с названием группы;
-    - xmax — правая граница строки/таблицы этой группы.
-    Не включай в box_2d соседние группы.
+    Если группа '{target_group}' найдена, верни box_2d: [ymin, xmin, ymax, xmax] — рамку ВСЕЙ вертикальной таблицы (колонки), в которой находится эта группа:
+    - ymin — верхняя граница таблицы (строка заголовка с датой);
+    - ymax — нижняя граница таблицы (после последней группы);
+    - xmin — левая граница таблицы (столбец '№ гр.');
+    - xmax — правая граница таблицы (конец столбца 'Преподаватель').
+    НЕ обрезай рамку по строкам группы '{target_group}' — нужна вся таблица, в которой она стоит, со всеми группами и заголовком.
+    Не включай в box_2d соседние таблицы.
     Если на листе представлены только другие группы (например '14П', '10П' и т.д.), но нет СТРОГО '{target_group}', верни group_found: false.
     
     Верни строго JSON:
@@ -406,6 +416,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                 model=model_name,
                 contents=[
                     genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    genai_types.Part.from_bytes(data=header_bytes, mime_type="image/jpeg"),
                     prompt_stage1
                 ],
                 config=genai_types.GenerateContentConfig(
@@ -442,7 +453,10 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     if not stage1_result:
         return {}
 
-    detected_date = stage1_result.get("date") or fallback_date
+    detected_date = stage1_result.get("date")
+    if not detected_date:
+        logger.warning("Дата на листе не прочитана — пропускаю лист.")
+        return {"date": None, "group_found": False, "lessons": []}
     if not stage1_result.get("group_found"):
         logger.info(f"Группа {target_group} не найдена на листе расписания (дата: {detected_date}).")
         return {"date": detected_date, "group_found": False, "lessons": []}
@@ -456,10 +470,10 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
         try:
             crop_bytes = crop_group_image(image_bytes, box_2d)
             prompt_stage2 = f"""
-            На увеличенном изображении представлена часть таблицы расписания колледжа.
-            1. Внимательно посмотри в левый столбец, где крупно написано название группы.
-               Какая группа там написана?
-               Если в левой ячейке группы написано НЕ '{target_group}' (например '10П', '8П', '9П' или любая другая группа), верни:
+            На увеличенном изображении представлена вертикальная таблица расписания колледжа с несколькими группами.
+            1. В левом столбце сверху вниз перечислены номера групп (например '14П', '148ш', '13П').
+               Найди среди них СТРОГО '{target_group}' (две единицы: 1-1-П).
+               Если группы '{target_group}' в этом столбце НЕТ, верни:
                {{
                  "group_matched": false,
                  "detected_group": "название_найденной_группы",
@@ -484,6 +498,7 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                  * Если пара напечатана одинаково в две строки (один предмет, одинаковый кабинет и одинаковый преподаватель) — это ОДИН урок для всей группы (subgroup: 0).
                - Если сверху или снизу виден фрагмент чужой группы, НЕ включай их! Извлекай ТОЛЬКО уроки для группы '{target_group}'!
                - Никогда не перескакивай и не сдвигай номера пар: проверь, что каждая цифра в колонке 'No ур' попала в итоговый список уроков!
+               - Номер аудитории читай по одной цифре слева направо, не меняй порядок цифр (379 ≠ 973).
 
                Ответ строго валидным JSON:
                {{
@@ -533,10 +548,10 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
                         ВНИМАНИЕ: Ранее был ошибочно выбран блок группы '{wrong_grp}'!
                         Целевая группа — СТРОГО '{target_group}' (две единицы: 1-1-П)!
                         Проверь ВСЕ таблицы на листе (левую, среднюю и правую часть) и другие строки.
-                        Если группа '{target_group}' есть на листе, укажи box_2d строго вокруг её блока:
-                        ymin — верх строки с названием группы, ymax — низ последнего урока этой группы,
-                        xmin — левая граница ячейки с названием, xmax — правая граница строки/таблицы.
-                        Не включай соседние группы.
+                        Если группа '{target_group}' есть на листе, укажи box_2d — рамку ВСЕЙ вертикальной таблицы (колонки), где она стоит:
+                        ymin — верх таблицы (заголовок с датой), ymax — низ таблицы (после последней группы),
+                        xmin — левая граница таблицы (столбец '№ гр.'), xmax — правая граница таблицы.
+                        НЕ обрезай рамку по строкам группы '{target_group}'. Не включай соседние таблицы.
                         Если на листе группы '{target_group}' нет, верни group_found: false.
 
                         Верни строго JSON:
@@ -673,38 +688,19 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str, fallback_date
     }
 
 
-def parse_caption_date(text: str | None) -> str | None:
-    match = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b", text or "")
-    if not match:
-        return None
-    day, month, year = map(int, match.groups())
-    if year < 100:
-        year += 2000
-    try:
-        return datetime(year, month, day, tzinfo=TZ).strftime("%Y-%m-%d")
-    except ValueError:
-        return None
-
-
-async def process_photo_message(msg, fallback_date: str | None = None) -> str | None:
+async def process_photo_message(msg) -> str | None:
     """Скачивает фото и сохраняет расписание при обнаружении группы."""
     if not msg.photo:
         return None
 
     img_data = await msg.download_media(file=bytes)
-    caption = getattr(msg, "message", None) or getattr(msg, "text", None)
-    caption_date = parse_caption_date(caption)
     result = await asyncio.to_thread(
-        parse_image_with_gemini, img_data, config.TARGET_GROUP, caption_date or fallback_date
+        parse_image_with_gemini, img_data, config.TARGET_GROUP
     )
 
-    detected_date = result.get("date")
-    if caption_date and detected_date and detected_date != caption_date:
-        logger.warning(
-            f"Дата на листе {detected_date} не совпала с подписью поста {caption_date}. Использую подпись."
-        )
-    doc_date = caption_date or detected_date
+    doc_date = result.get("date")
     if not doc_date or not isinstance(doc_date, str):
+        logger.warning(f"Не удалось прочитать дату на листе (пост {msg.id}). Пропуск.")
         return None
 
     doc_date = doc_date.strip()
@@ -748,7 +744,7 @@ async def sync_schedule_if_needed(force: bool = False) -> list[str]:
                 continue
 
             logger.info(f"Скачиваем фото из поста ID: {msg.id}...")
-            parsed_date = await process_photo_message(msg, today_str)
+            parsed_date = await process_photo_message(msg)
             await asyncio.sleep(2)
 
             if parsed_date:
@@ -795,7 +791,7 @@ async def sync_nextday_schedule() -> tuple[bool, str, str]:
                 continue
 
             logger.info(f"Скачиваем фото из поста ID: {msg.id} для проверки следующего дня...")
-            parsed_date = await process_photo_message(msg, next_date_str)
+            parsed_date = await process_photo_message(msg)
             await asyncio.sleep(2)
 
             if parsed_date:
@@ -843,7 +839,7 @@ async def handle_channel_post(event):
     today_str = now.strftime("%Y-%m-%d")
 
     async with parse_lock:
-        parsed_date = await process_photo_message(event.message, today_str)
+        parsed_date = await process_photo_message(event.message)
         if parsed_date:
             logger.info(f"Пост успешно обработан. Данные на {parsed_date} обновлены.")
 
