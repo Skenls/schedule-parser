@@ -164,9 +164,11 @@ def normalize_lessons(lessons: list[dict]) -> list[dict]:
 
     normalized: list[dict] = []
     for l_num, items in sorted(by_lesson.items()):
-        # Если только один урок в этой паре — это вся группа (subgroup: 0)
+        # Если только один урок в этой паре — это вся группа (subgroup: 0),
+        # кроме случая, когда модель явно указала первую/вторую подгруппу.
         if len(items) == 1:
-            items[0]["subgroup"] = 0
+            if items[0]["subgroup"] not in (1, 2):
+                items[0]["subgroup"] = 0
             normalized.append(items[0])
             continue
 
@@ -287,6 +289,25 @@ def crop_group_image(image_bytes: bytes, box_2d: list) -> bytes:
     return out.getvalue()
 
 
+def apply_absent_subgroups(lessons: list[dict], absent: list | None) -> list[dict]:
+    """Пары только для первой подгруппы (галочка в пустой строке)."""
+    first_only = set()
+    for item in absent or []:
+        try:
+            first_only.add(int(item.get("lesson_num") if isinstance(item, dict) else item))
+        except (TypeError, ValueError):
+            continue
+    for lesson in lessons:
+        if lesson.get("subgroup") == 0 and lesson.get("lesson_num") in first_only:
+            lesson["subgroup"] = 1
+    return lessons
+
+
+def has_number_gaps(lessons: list[dict]) -> bool:
+    nums = sorted({l["lesson_num"] for l in lessons})
+    return any(b - a > 1 for a, b in zip(nums, nums[1:]))
+
+
 def normalize_parsed_lessons(lessons: list[dict]) -> list[dict]:
     """Детерминированно очищает, объединяет дубликаты и нормализует подгруппы уроков."""
     by_num: dict[int, list[dict]] = {}
@@ -330,7 +351,10 @@ def normalize_parsed_lessons(lessons: list[dict]) -> list[dict]:
         if not items:
             continue
         if len(items) == 1:
-            items[0]["subgroup"] = 0
+            if items[0]["subgroup"] not in (1, 2):
+                # Языки в колледже идут только по подгруппам, одиночная строка — 1-я.
+                is_lang = "язык" in items[0]["subject"].lower()
+                items[0]["subgroup"] = 1 if is_lang else 0
             result.append(items[0])
         else:
             it1 = items[0]
@@ -491,19 +515,25 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str) -> dict:
                ВАЖНЫЕ ПРАВИЛА ВЕРТИКАЛЬНОГО СОПОСТАВЛЕНИЯ СТРОК И НОМЕРОВ ПАР:
                - Внимательно смотри строго по горизонтали: какой номер пары в колонке 'No ур' соответствует строке предмета.
                - ДЕЛЕНИЕ НА ПОДГРУППЫ:
-                 * Если у пары ДВЕ строки (два разных кабинета, например 310 и 515, или разные преподаватели/предметы), номер пары пишется ОДИН РАЗ напротив первой строки, а напротив второй строки в колонке 'No ур' ПУСТО (нет новой цифры). Обе эти строки относятся к этой одной паре (subgroup 1 и subgroup 2)!
+                 * Номера пар уже напечатаны на листе. НЕ нумеруй строки заново: если рядом стоит '4' — верни lesson_num 4.
+                 * Если номер стоит между двумя строками с предметом (или на границе), это ОДНА пара из двух подгрупп: верхняя subgroup 1, нижняя subgroup 2.
+                 * Номер стоит у строки с предметом, а под ней ПУСТАЯ строка без предмета (обычно с галочкой '✓') — пара только у ПЕРВОЙ подгруппы: subgroup 1.
+                 * Галочка '✓' стоит у номера, а предмет только в нижней строке — пара только у ВТОРОЙ подгруппы: subgroup 2.
+                 * Две строки с ОДНИМ номером и разными кабинетами/преподавателями — две подгруппы, даже если предмет одинаковый.
                  * Если по физкультуре сверху 'ФизичКультура', а снизу 'СМГ' (или 'СМГ6') — это подгруппы 1 и 2 одной пары. Кабинет у физкультуры и СМГ пустой ("").
                - ВСЯ ГРУППА:
-                 * Если пара для всей группы (один кабинет, один предмет), то у каждой такой пары СВОЙ отдельный номер в колонке 'No ур' (например, цифры 4, 5, 6, 7, 8 идут подряд, каждая напротив своей строки). Не объединяй строки с разными номерами пар!
-                 * Если пара напечатана одинаково в две строки (один предмет, одинаковый кабинет и одинаковый преподаватель) — это ОДИН урок для всей группы (subgroup: 0).
+                 * У пары для всей группы номер стоит прямо на строке; такие строки НЕ объединяй.
+                 * Две одинаковые строки с ОДНИМ номером (предмет, кабинет, преподаватель) — это ОДИН урок для всей группы (subgroup: 0).
                - Если сверху или снизу виден фрагмент чужой группы, НЕ включай их! Извлекай ТОЛЬКО уроки для группы '{target_group}'!
                - Никогда не перескакивай и не сдвигай номера пар: проверь, что каждая цифра в колонке 'No ур' попала в итоговый список уроков!
-               - Номер аудитории читай по одной цифре слева направо, не меняй порядок цифр (379 ≠ 973).
+               - Номера аудиторий напечатаны ВЕРТИКАЛЬНО (повёрнуты на 90°). Мысленно разверни их и прочитай как обычное число (например 3-0-6 = 306), сохраняя порядок цифр.
+               - В поле "absent_subgroups" перечисли номера пар, которые есть только у первой подгруппы (пустая строка с галочкой): [1].
 
                Ответ строго валидным JSON:
                {{
                  "group_matched": true,
                  "detected_group": "{target_group}",
+                 "absent_subgroups": [1],
                  "lessons": [
                    {{"lesson_num": 2, "subgroup": 1, "subject": "...", "auditorium": "...", "teacher": "..."}},
                    {{"lesson_num": 2, "subgroup": 2, "subject": "...", "auditorium": "...", "teacher": "..."}}
@@ -607,7 +637,13 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str) -> dict:
                                 if d2_ret.get("group_matched") is not False:
                                     raw_lessons = d2_ret.get("lessons", [])
                                     if raw_lessons:
-                                        lessons = normalize_parsed_lessons(raw_lessons)
+                                        lessons = apply_absent_subgroups(
+                                            normalize_parsed_lessons(raw_lessons),
+                                            d2_ret.get("absent_subgroups"),
+                                        )
+                                        if has_number_gaps(lessons):
+                                            logger.warning("Пропуск в номерах пар после retry — пробую следующую модель.")
+                                            continue
                                         logger.info(f"✅ Stage 2 (после retry) успешно извлек {len(lessons)} уроков для {target_group}.")
                                         break
                         except Exception as e_ret:
@@ -618,7 +654,13 @@ def parse_image_with_gemini(image_bytes: bytes, target_group: str) -> dict:
                             return {"date": detected_date, "group_found": False, "lessons": []}
                     raw_lessons = d2.get("lessons", [])
                     if raw_lessons:
-                        lessons = normalize_parsed_lessons(raw_lessons)
+                        lessons = apply_absent_subgroups(
+                            normalize_parsed_lessons(raw_lessons),
+                            d2.get("absent_subgroups"),
+                        )
+                        if has_number_gaps(lessons):
+                            logger.warning("Пропуск в номерах пар — пробую следующую модель.")
+                            continue
                         logger.info(f"✅ Stage 2 успешно извлек {len(lessons)} уроков для {target_group} через {model_name}.")
                         break
                 except Exception as e:
